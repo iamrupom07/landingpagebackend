@@ -14,7 +14,8 @@ export function errorHandler(
     const errAsAny = err as unknown as Record<string, unknown>;
     const code = errAsAny["code"];
 
-    // Prisma errors
+    // Prisma errors — checked first so Prisma P2025 ("not found") is never
+    // accidentally caught by the generic knownPhrases branch below.
     if (code === "P2025") {
       res.status(404).json({ success: false, message: "Record not found" });
       return;
@@ -24,13 +25,16 @@ export function errorHandler(
       return;
     }
 
-    // Known user-facing errors
-    const knownPhrases = ["Invalid credentials", "already exists", "not found"];
-    if (
-      knownPhrases.some((m) =>
-        err.message.toLowerCase().includes(m.toLowerCase()),
-      )
-    ) {
+    // FIX: "not found" was in knownPhrases which returned 400. Any manual
+    // throw new Error("Lead not found") should be a 404, not a 400.
+    // Split the phrases by intended status code.
+    if (err.message.toLowerCase().includes("not found")) {
+      res.status(404).json({ success: false, message: err.message });
+      return;
+    }
+
+    const badRequestPhrases = ["Invalid credentials", "already exists"];
+    if (badRequestPhrases.some((m) => err.message.toLowerCase().includes(m.toLowerCase()))) {
       res.status(400).json({ success: false, message: err.message });
       return;
     }
