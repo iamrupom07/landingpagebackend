@@ -4,12 +4,6 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  // FIX: Prisma v7 with driver adapters does NOT support `url` in the schema
-  // datasource block. The connection is configured exclusively via the adapter
-  // in prisma.config.ts. Leaving `url = env("DATABASE_URL")` here causes
-  // `prisma generate` to fail with P1012, so the generated client is stale
-  // and missing the `source` field — causing every query that filters by
-  // source to throw "Unknown argument `source`".
 }
 
 // ─── Enums ────────────────────────────────────────────────────────────────────

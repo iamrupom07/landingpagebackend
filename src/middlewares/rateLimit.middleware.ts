@@ -1,6 +1,6 @@
-import rateLimit, { type Options } from 'express-rate-limit';
-import { RedisStore } from 'rate-limit-redis';
-import { getRedis } from '../config/redis';
+import rateLimit, { type Options } from "express-rate-limit";
+import { RedisStore } from "rate-limit-redis";
+import { getRedis } from "../config/redis";
 
 type LimiterOptions = Partial<Options> & {
   name: string;
@@ -12,10 +12,11 @@ function redisStore(name: string): RedisStore | undefined {
 
   return new RedisStore({
     prefix: `rl:${name}:`,
-    sendCommand: (...args: string[]) => {
+    sendCommand: async (...args: string[]) => {
       const [command, ...params] = args;
-      if (!command) throw new Error('Redis command is required');
-      return redis.call(command, ...params) as Promise<string | number | boolean | Array<string | number | boolean>>;
+      if (!command) throw new Error("Redis command is required");
+      const result = await (redis.call(command, ...params) as Promise<unknown>);
+      return result as number | string | string[];
     },
   });
 }
