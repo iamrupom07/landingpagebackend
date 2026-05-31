@@ -33,7 +33,12 @@ export function errorHandler(
       return;
     }
 
-    const badRequestPhrases = ["Invalid credentials", "already exists"];
+    const badRequestPhrases = [
+      "Invalid credentials",
+      "already exists",
+      "Invalid current password",
+      "Invalid or expired reset token",
+    ];
     if (badRequestPhrases.some((m) => err.message.toLowerCase().includes(m.toLowerCase()))) {
       res.status(400).json({ success: false, message: err.message });
       return;

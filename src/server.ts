@@ -1,61 +1,61 @@
 import app from "./app";
 import { env } from "./config/env";
-import { prisma } from "./db/prisma";
+import { closeRedis } from "./config/redis";
+import { closePrisma, prisma } from "./db/prisma";
+import { closeEmailQueue } from "./modules/email/email.queue";
+import { emailService } from "./modules/email/email.service";
 
 const PORT = Number(env.PORT);
 
 async function bootstrap() {
-  // NOTE: prisma.$connect() / prisma.$disconnect() are NOT supported when using
-  // Prisma v7 driver adapters (PrismaPg). The pg.Pool manages its own connection
-  // lifecycle. Calling $connect() throws "Driver adapters do not support
-  // $connect()". We validate the DB is reachable instead with a lightweight query.
   try {
-    await (prisma as any).$queryRaw`SELECT 1`;
-    console.log("✅ Database connected");
+    await prisma.$queryRaw`SELECT 1`;
+    console.log("Database connected");
   } catch (err) {
-    console.error("❌ Database connection failed:", err);
+    console.error("Database connection failed:", err);
     process.exit(1);
   }
 
+  try {
+    const smtpReady = await emailService.verifyTransport();
+    console.log(smtpReady ? "SMTP transport verified" : "SMTP not configured");
+  } catch (err) {
+    console.error("SMTP verification failed:", err);
+    if (env.NODE_ENV === "production") process.exit(1);
+  }
+
   const server = app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`🌍 Environment: ${env.NODE_ENV}`);
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Environment: ${env.NODE_ENV}`);
   });
 
   const shutdown = async (signal: string) => {
-    console.log(`\n${signal} received — starting graceful shutdown...`);
+    console.log(`${signal} received - starting graceful shutdown`);
     server.close(async () => {
-      console.log("🔌 HTTP server closed");
-      // Use $disconnect() only if available (non-adapter clients); driver-adapter
-      // clients don't expose it — the pool is cleaned up automatically on process exit.
-      if (typeof (prisma as any).$disconnect === "function") {
-        try {
-          await (prisma as any).$disconnect();
-        } catch {
-          /* ignore */
-        }
-      }
-      console.log("🗄️  Database disconnected");
+      await closeEmailQueue();
+      await closeRedis();
+      await closePrisma();
+      console.log("Shutdown complete");
       process.exit(0);
     });
     setTimeout(() => {
-      console.error("❌ Forced exit");
+      console.error("Forced exit");
       process.exit(1);
     }, 10_000);
   };
 
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("unhandledRejection", (reason) => {
-    console.error("💥 Unhandled rejection:", reason);
+    console.error("Unhandled rejection:", reason);
   });
   process.on("uncaughtException", (err) => {
-    console.error("💥 Uncaught exception:", err);
+    console.error("Uncaught exception:", err);
     process.exit(1);
   });
 }
 
 bootstrap().catch((err) => {
-  console.error("❌ Failed to start server:", err);
+  console.error("Failed to start server:", err);
   process.exit(1);
 });

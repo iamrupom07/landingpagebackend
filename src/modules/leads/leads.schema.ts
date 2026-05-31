@@ -1,16 +1,16 @@
 import { z } from 'zod';
 
-export const PLAN_MAP: Record<string, string> = {
+export const PLAN_MAP = {
   starter:      'STARTER',
   professional: 'PROFESSIONAL',
   enterprise:   'ENTERPRISE',
-};
+} as const;
 
-export const PLAN_MAP_REVERSE: Record<string, string> = {
+export const PLAN_MAP_REVERSE = {
   STARTER:      'starter',
   PROFESSIONAL: 'professional',
   ENTERPRISE:   'enterprise',
-};
+} as const;
 
 export const PLAN_LABELS: Record<string, string> = {
   starter:      '300 Mbps — $59.99/month',
@@ -18,21 +18,21 @@ export const PLAN_LABELS: Record<string, string> = {
   enterprise:   '2 Gig — $134.99/month',
 };
 
-export const STATUS_MAP: Record<string, string> = {
+export const STATUS_MAP = {
   new:         'NEW',
   contacted:   'CONTACTED',
   qualified:   'QUALIFIED',
   closed_won:  'CLOSED_WON',
   closed_lost: 'CLOSED_LOST',
-};
+} as const;
 
-export const STATUS_MAP_REVERSE: Record<string, string> = {
+export const STATUS_MAP_REVERSE = {
   NEW:         'new',
   CONTACTED:   'contacted',
   QUALIFIED:   'qualified',
   CLOSED_WON:  'closed_won',
   CLOSED_LOST: 'closed_lost',
-};
+} as const;
 
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -83,8 +83,16 @@ export const getLeadsQuerySchema = z.object({
   source:   z.enum(['form', 'manual']).optional(),
 });
 
+export const exportLeadsQuerySchema = z.object({
+  status: z.enum(['new', 'contacted', 'qualified', 'closed_won', 'closed_lost']).optional(),
+  plan:   z.enum(['starter', 'professional', 'enterprise']).optional(),
+  search: z.string().max(100).optional(),
+  source: z.enum(['form', 'manual']).optional(),
+});
+
 export type CreateLeadInput       = z.infer<typeof createLeadSchema>;
 export type CreateManualLeadInput = z.infer<typeof createManualLeadSchema>;
 export type UpdateLeadStatusInput = z.infer<typeof updateLeadStatusSchema>;
 export type SendEmailInput        = z.infer<typeof sendEmailSchema>;
 export type GetLeadsQuery         = z.infer<typeof getLeadsQuerySchema>;
+export type ExportLeadsQuery      = z.infer<typeof exportLeadsQuerySchema>;

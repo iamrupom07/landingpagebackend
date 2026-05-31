@@ -2,11 +2,12 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
-import rateLimit from "express-rate-limit";
 import { corsOrigins } from "./config/env";
+import { pingRedis } from "./config/redis";
 import { requestIdMiddleware } from "./middlewares/requestId.middleware";
 import { requestLogger } from "./middlewares/logger.middleware";
 import { errorHandler } from "./middlewares/error.middleware";
+import { createRateLimiter } from "./middlewares/rateLimit.middleware";
 import leadsRouter from "./modules/leads/leads.router";
 import authRouter from "./modules/auth/auth.router";
 import analyticsRouter from "./modules/analytics/analytics.router";
@@ -32,22 +33,20 @@ app.use(
 );
 app.use(compression());
 
-const globalLimiter = rateLimit({
+const globalLimiter = createRateLimiter({
+  name: "global",
   windowMs: 15 * 60 * 1000,
   max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: {
     success: false,
     message: "Too many requests, please try again later.",
   },
 });
 
-const leadSubmitLimiter = rateLimit({
+const leadSubmitLimiter = createRateLimiter({
+  name: "lead-submit",
   windowMs: 60 * 60 * 1000,
   max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: {
     success: false,
     message: "Too many submissions from this IP. Please try again later.",
@@ -67,7 +66,7 @@ app.get("/health", (_req, res) => {
 // Deep health check — tests the actual DB connection and reports any error
 app.get("/health/db", async (_req, res) => {
   try {
-    await (prisma as any).$queryRaw`SELECT 1`;
+    await prisma.$queryRaw`SELECT 1`;
     res.json({
       status: "ok",
       db: "connected",
@@ -77,6 +76,30 @@ app.get("/health/db", async (_req, res) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ status: "error", db: "failed", error: message });
   }
+});
+
+app.get("/health/ready", async (_req, res) => {
+  const checks = { db: "unknown", redis: "unknown" };
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    checks.db = "connected";
+  } catch {
+    checks.db = "failed";
+  }
+
+  try {
+    checks.redis = (await pingRedis()) ? "connected" : "not_configured";
+  } catch {
+    checks.redis = "failed";
+  }
+
+  const healthy = checks.db === "connected" && checks.redis === "connected";
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? "ok" : "error",
+    checks,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 app.use("/api/auth", authRouter);

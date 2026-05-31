@@ -8,9 +8,11 @@ declare global {
   var __prisma: PrismaClient | undefined;
 }
 
+let pool: pg.Pool | undefined;
+
 function createClient(): PrismaClient {
   // Prisma v7: PrismaPg takes a pg.Pool instance, NOT a {connectionString} object
-  const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+  pool = new pg.Pool({ connectionString: env.DATABASE_URL });
   const adapter = new PrismaPg(pool);
 
   return new PrismaClient({
@@ -23,4 +25,12 @@ export const prisma: PrismaClient = global.__prisma ?? createClient();
 
 if (env.NODE_ENV !== "production") {
   global.__prisma = prisma;
+}
+
+export async function closePrisma(): Promise<void> {
+  await prisma.$disconnect().catch(() => undefined);
+  if (pool) {
+    await pool.end().catch(() => undefined);
+    pool = undefined;
+  }
 }

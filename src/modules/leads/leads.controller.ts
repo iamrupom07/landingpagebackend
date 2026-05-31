@@ -1,9 +1,11 @@
 import type { Request, Response } from 'express';
+import { env } from '../../config/env';
 import { leadsService } from './leads.service';
-import { emailService } from '../email/email.service';
+import { enqueueEmailJob } from '../email/email.queue';
 import {
   createLeadSchema,
   createManualLeadSchema,
+  exportLeadsQuerySchema,
   updateLeadStatusSchema,
   sendEmailSchema,
   getLeadsQuerySchema,
@@ -18,7 +20,15 @@ const CSV_HEADERS: (keyof LeadApiShape)[] = [
 
 function escapeCSV(value: string | undefined | null): string {
   const v = value ?? '';
-  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+function writeChunk(res: Response, chunk: string): Promise<void> {
+  if (res.write(chunk)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    res.once('drain', resolve);
+    res.once('error', reject);
+  });
 }
 
 export class LeadsController {
@@ -35,8 +45,10 @@ export class LeadsController {
 
     const lead = await leadsService.create(parsed.data, ipAddress);
 
-    emailService.sendLeadNotification(lead).catch(console.error);
-    emailService.sendLeadConfirmation(lead).catch(console.error);
+    void Promise.all([
+      enqueueEmailJob({ type: 'lead-notification', lead }),
+      enqueueEmailJob({ type: 'lead-confirmation', lead }),
+    ]).catch((err) => console.error('Failed to queue lead email jobs:', err));
 
     return res.status(201).json({
       success: true,
@@ -66,8 +78,13 @@ export class LeadsController {
       return res.status(400).json({ success: false, errors: parsed.error.flatten().fieldErrors });
     }
 
-    await emailService.sendCustomEmail(lead, parsed.data.subject, parsed.data.body);
-    return res.json({ success: true, message: 'Email sent successfully' });
+    await enqueueEmailJob({
+      type: 'custom-email',
+      lead,
+      subject: parsed.data.subject,
+      body: parsed.data.body,
+    });
+    return res.json({ success: true, message: 'Email queued successfully' });
   }
 
   // ─── Admin: list all leads ─────────────────────────────────────────────────
@@ -81,20 +98,29 @@ export class LeadsController {
   }
 
   async exportCSV(req: Request, res: Response) {
-    const q      = req.query as Record<string, string | undefined>;
-    const status = q['status'] as Parameters<typeof leadsService.findAllForExport>[0]['status'];
-    const plan   = q['plan']   as Parameters<typeof leadsService.findAllForExport>[0]['plan'];
-    const source = q['source'] as Parameters<typeof leadsService.findAllForExport>[0]['source'];
-    const search = q['search'];
+    const parsed = exportLeadsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, errors: parsed.error.flatten().fieldErrors });
+    }
 
-    const leads    = await leadsService.findAllForExport({ status, plan, search, source });
-    const rows     = leads.map((l) => CSV_HEADERS.map((h) => escapeCSV(l[h] as string | undefined)).join(','));
-    const csv      = [CSV_HEADERS.join(','), ...rows].join('\n');
+    const total = await leadsService.countForExport(parsed.data);
     const filename = `leads-${new Date().toISOString().slice(0, 10)}.csv`;
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    return res.send(csv);
+    if (total > env.MAX_EXPORT_ROWS) {
+      res.setHeader('X-Export-Truncated', 'true');
+    }
+
+    await writeChunk(res, `${CSV_HEADERS.join(',')}\n`);
+    for await (const batch of leadsService.iterateForExport(parsed.data, env.MAX_EXPORT_ROWS)) {
+      for (const lead of batch) {
+        const row = CSV_HEADERS.map((h) => escapeCSV(lead[h] as string | undefined)).join(',');
+        await writeChunk(res, `${row}\n`);
+      }
+    }
+
+    return res.end();
   }
 
   async findById(req: Request, res: Response) {

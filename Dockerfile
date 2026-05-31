@@ -9,6 +9,7 @@ RUN npm ci
 
 # Copy source and compile
 COPY tsconfig.json ./
+COPY prisma.config.ts ./
 COPY prisma ./prisma/
 COPY src ./src/
 
@@ -30,6 +31,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY prisma ./prisma/
+COPY prisma.config.ts ./
 
 # Non-root user for security
 RUN addgroup --system --gid 1001 nodejs && \
@@ -38,5 +40,4 @@ USER express
 
 EXPOSE 5000
 
-# Run migrations then start the server
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
+CMD ["node", "dist/server.js"]

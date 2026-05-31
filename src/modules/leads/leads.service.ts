@@ -1,7 +1,11 @@
+import type { Lead, Prisma } from "@prisma/client";
 import { prisma } from "../../db/prisma";
+import { cacheService } from "../../services/cache.service";
+import { env } from "../../config/env";
 import type {
   CreateLeadInput,
   CreateManualLeadInput,
+  ExportLeadsQuery,
   GetLeadsQuery,
   UpdateLeadStatusInput,
 } from "./leads.schema";
@@ -11,6 +15,10 @@ import {
   STATUS_MAP,
   STATUS_MAP_REVERSE,
 } from "./leads.schema";
+
+const SUMMARY_CACHE_KEY = "analytics:summary";
+const SUMMARY_CACHE_TTL_SECONDS = 60;
+const EXPORT_BATCH_SIZE = 500;
 
 export interface LeadApiShape {
   id: string;
@@ -30,25 +38,45 @@ export interface LeadApiShape {
   updatedAt: string;
 }
 
-interface DbLead {
-  id: string;
-  businessName: string;
-  businessAddress: string;
-  contactName: string;
-  phone: string;
-  email: string;
-  currentProvider: string;
-  interestedPlan: string | null;
-  employeeCount: number | null;
-  comments: string | null;
-  status: string;
-  source: string;
-  ipAddress: string | null;
-  createdAt: Date;
-  updatedAt: Date;
+export interface LeadSummary {
+  total: number;
+  new: number;
+  contacted: number;
+  qualified: number;
+  closed_won: number;
+  closed_lost: number;
+  byPlan: {
+    starter: number;
+    professional: number;
+    enterprise: number;
+  };
+  recentCount: number;
+  formCount: number;
+  manualCount: number;
+  conversionRate: number;
 }
 
-function transformLead(lead: DbLead): LeadApiShape {
+type ExportCursor = {
+  createdAt: Date;
+  id: string;
+};
+
+type SummaryRow = {
+  total: number | bigint | string;
+  new_count: number | bigint | string;
+  contacted_count: number | bigint | string;
+  qualified_count: number | bigint | string;
+  closed_won_count: number | bigint | string;
+  closed_lost_count: number | bigint | string;
+  starter_count: number | bigint | string;
+  professional_count: number | bigint | string;
+  enterprise_count: number | bigint | string;
+  recent_count: number | bigint | string;
+  form_count: number | bigint | string;
+  manual_count: number | bigint | string;
+};
+
+function transformLead(lead: Lead): LeadApiShape {
   return {
     id: lead.id,
     businessName: lead.businessName,
@@ -72,8 +100,57 @@ function transformLead(lead: DbLead): LeadApiShape {
   };
 }
 
+function toNumber(value: number | bigint | string): number {
+  return typeof value === "number" ? value : Number(value);
+}
+
+function buildLeadWhere(
+  query: Pick<GetLeadsQuery, "status" | "plan" | "search" | "source"> | ExportLeadsQuery,
+): Prisma.LeadWhereInput {
+  const where: Prisma.LeadWhereInput = {};
+  if (query.status) where.status = STATUS_MAP[query.status];
+  if (query.plan) where.interestedPlan = PLAN_MAP[query.plan];
+  if (query.source) where.source = query.source;
+
+  const search = query.search?.trim();
+  if (search) {
+    where.OR = [
+      { businessName: { contains: search, mode: "insensitive" } },
+      { contactName: { contains: search, mode: "insensitive" } },
+      { email: { contains: search, mode: "insensitive" } },
+    ];
+  }
+
+  return where;
+}
+
+function addExportCursor(
+  where: Prisma.LeadWhereInput,
+  cursor?: ExportCursor,
+): Prisma.LeadWhereInput {
+  if (!cursor) return where;
+
+  return {
+    AND: [
+      where,
+      {
+        OR: [
+          { createdAt: { lt: cursor.createdAt } },
+          { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+        ],
+      },
+    ],
+  };
+}
+
+async function invalidateSummaryCache(): Promise<void> {
+  await cacheService.delete(SUMMARY_CACHE_KEY).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Failed to invalidate summary cache:", message);
+  });
+}
+
 export class LeadsService {
-  // ─── Public form submission ────────────────────────────────────────────────
   async create(
     data: CreateLeadInput,
     ipAddress?: string,
@@ -86,7 +163,7 @@ export class LeadsService {
       ? PLAN_MAP[data.interestedPlan]
       : undefined;
 
-    const lead = (await (prisma as any).lead.create({
+    const lead = await prisma.lead.create({
       data: {
         businessName: data.businessName,
         businessAddress: data.businessAddress,
@@ -100,19 +177,19 @@ export class LeadsService {
         ...(data.comments ? { comments: data.comments } : {}),
         ipAddress: ipAddress ?? null,
       },
-    })) as DbLead;
+    });
 
+    await invalidateSummaryCache();
     return transformLead(lead);
   }
 
-  // ─── Admin manual lead creation ────────────────────────────────────────────
   async createManual(data: CreateManualLeadInput): Promise<LeadApiShape> {
     const interestedPlan = data.interestedPlan
       ? PLAN_MAP[data.interestedPlan]
       : undefined;
-    const statusDb = STATUS_MAP[data.status ?? "new"] ?? "NEW";
+    const statusDb = STATUS_MAP[data.status ?? "new"];
 
-    const lead = (await (prisma as any).lead.create({
+    const lead = await prisma.lead.create({
       data: {
         businessName: data.businessName,
         businessAddress: data.businessAddress,
@@ -126,41 +203,27 @@ export class LeadsService {
         ...(data.employeeCount ? { employeeCount: data.employeeCount } : {}),
         ...(data.comments ? { comments: data.comments } : {}),
       },
-    })) as DbLead;
+    });
 
+    await invalidateSummaryCache();
     return transformLead(lead);
   }
 
-  // ─── List with filters ─────────────────────────────────────────────────────
   async findAll(query: GetLeadsQuery) {
     const pageSize = query.pageSize ?? query.limit ?? 20;
     const page = Math.max(1, query.page);
-    const { status, plan, search, source } = query;
     const skip = (page - 1) * pageSize;
+    const where = buildLeadWhere(query);
 
-    const where: Record<string, unknown> = {};
-    if (status) where["status"] = STATUS_MAP[status];
-    if (plan) where["interestedPlan"] = PLAN_MAP[plan];
-    if (source) where["source"] = source;
-    if (search) {
-      where["OR"] = [
-        { businessName: { contains: search, mode: "insensitive" } },
-        { contactName: { contains: search, mode: "insensitive" } },
-        { email: { contains: search, mode: "insensitive" } },
-      ];
-    }
-
-    // $transaction([]) is NOT supported with driver adapters in Prisma v7.
-    // Use Promise.all() instead for parallel queries.
-    const [rows, total] = (await Promise.all([
-      (prisma as any).lead.findMany({
+    const [rows, total] = await Promise.all([
+      prisma.lead.findMany({
         where,
         orderBy: { createdAt: "desc" },
         skip,
         take: pageSize,
       }),
-      (prisma as any).lead.count({ where }),
-    ])) as [DbLead[], number];
+      prisma.lead.count({ where }),
+    ]);
 
     return {
       leads: rows.map(transformLead),
@@ -172,10 +235,10 @@ export class LeadsService {
   }
 
   async findById(id: string) {
-    const lead = (await (prisma as any).lead.findUnique({
+    const lead = await prisma.lead.findUnique({
       where: { id },
       include: { emailLogs: { orderBy: { sentAt: "desc" } } },
-    })) as (DbLead & { emailLogs: unknown[] }) | null;
+    });
 
     if (!lead) return null;
     return { ...transformLead(lead), emailLogs: lead.emailLogs };
@@ -185,112 +248,111 @@ export class LeadsService {
     id: string,
     data: UpdateLeadStatusInput,
   ): Promise<LeadApiShape> {
-    const lead = (await (prisma as any).lead.update({
+    const lead = await prisma.lead.update({
       where: { id },
       data: { status: STATUS_MAP[data.status] },
-    })) as DbLead;
+    });
+    await invalidateSummaryCache();
     return transformLead(lead);
   }
 
   async delete(id: string): Promise<void> {
-    await (prisma as any).lead.delete({ where: { id } });
+    await prisma.lead.delete({ where: { id } });
+    await invalidateSummaryCache();
   }
 
-  async findAllForExport(
-    query: Pick<GetLeadsQuery, "status" | "plan" | "search" | "source">,
-  ): Promise<LeadApiShape[]> {
-    const where: Record<string, unknown> = {};
-    if (query.status) where["status"] = STATUS_MAP[query.status];
-    if (query.plan) where["interestedPlan"] = PLAN_MAP[query.plan];
-    if (query.source) where["source"] = query.source;
-    if (query.search) {
-      where["OR"] = [
-        { businessName: { contains: query.search, mode: "insensitive" } },
-        { contactName: { contains: query.search, mode: "insensitive" } },
-        { email: { contains: query.search, mode: "insensitive" } },
-      ];
-    }
-    const rows = (await (prisma as any).lead.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-    })) as DbLead[];
-    return rows.map(transformLead);
+  async countForExport(query: ExportLeadsQuery): Promise<number> {
+    return prisma.lead.count({ where: buildLeadWhere(query) });
   }
 
-  async getSummary() {
-    const sevenDaysAgo = new Date(Date.now() - 7 * 86_400_000);
+  async *iterateForExport(
+    query: ExportLeadsQuery,
+    maxRows = env.MAX_EXPORT_ROWS,
+    batchSize = EXPORT_BATCH_SIZE,
+  ): AsyncGenerator<LeadApiShape[]> {
+    const baseWhere = buildLeadWhere(query);
+    let cursor: ExportCursor | undefined;
+    let remaining = maxRows;
 
-    // $transaction([]) is NOT supported with driver adapters in Prisma v7.
-    // Use Promise.all() for parallel queries.
-    const [total, byStatus, byPlan, recentCount] = (await Promise.all([
-      (prisma as any).lead.count(),
-      (prisma as any).lead.groupBy({ by: ["status"], _count: { _all: true } }),
-      (prisma as any).lead.groupBy({
-        by: ["interestedPlan"],
-        _count: { _all: true },
-      }),
-      (prisma as any).lead.count({
-        where: { createdAt: { gte: sevenDaysAgo } },
-      }),
-    ])) as [
-      number,
-      Array<{ status: string; _count: { _all: number } }>,
-      Array<{ interestedPlan: string | null; _count: { _all: number } }>,
-      number,
-    ];
+    while (remaining > 0) {
+      const take = Math.min(batchSize, remaining);
+      const rows = await prisma.lead.findMany({
+        where: addExportCursor(baseWhere, cursor),
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take,
+      });
 
-    // Source counts in a separate try/catch — gracefully returns 0 if
-    // the migration hasn't been run yet and the source column is missing.
-    let formCount = 0;
-    let manualCount = 0;
-    try {
-      [formCount, manualCount] = (await Promise.all([
-        (prisma as any).lead.count({ where: { source: "form" } }),
-        (prisma as any).lead.count({ where: { source: "manual" } }),
-      ])) as [number, number];
-    } catch {
-      // source column not yet migrated — safe to ignore
+      if (rows.length === 0) return;
+
+      yield rows.map(transformLead);
+      remaining -= rows.length;
+
+      const last = rows[rows.length - 1]!;
+      cursor = { createdAt: last.createdAt, id: last.id };
+
+      if (rows.length < take) return;
     }
+  }
 
-    const statusCounts: Record<string, number> = {};
-    for (const row of byStatus) {
-      statusCounts[STATUS_MAP_REVERSE[row.status] ?? row.status.toLowerCase()] =
-        row._count._all;
+  async findAllForExport(query: ExportLeadsQuery): Promise<LeadApiShape[]> {
+    const leads: LeadApiShape[] = [];
+    for await (const batch of this.iterateForExport(query)) {
+      leads.push(...batch);
     }
+    return leads;
+  }
 
-    const planCounts: Record<string, number> = {
-      starter: 0,
-      professional: 0,
-      enterprise: 0,
-    };
-    for (const row of byPlan) {
-      if (row.interestedPlan) {
-        planCounts[
-          PLAN_MAP_REVERSE[row.interestedPlan] ??
-            row.interestedPlan.toLowerCase()
-        ] = row._count._all;
-      }
-    }
+  async getSummary(): Promise<LeadSummary> {
+    const cached = await cacheService.getJson<LeadSummary>(SUMMARY_CACHE_KEY);
+    if (cached) return cached;
 
-    const closedWon = statusCounts["closed_won"] ?? 0;
+    const rows = await prisma.$queryRaw<SummaryRow[]>`
+      SELECT
+        (COUNT(*))::int AS total,
+        (COUNT(*) FILTER (WHERE "status" = 'NEW'))::int AS new_count,
+        (COUNT(*) FILTER (WHERE "status" = 'CONTACTED'))::int AS contacted_count,
+        (COUNT(*) FILTER (WHERE "status" = 'QUALIFIED'))::int AS qualified_count,
+        (COUNT(*) FILTER (WHERE "status" = 'CLOSED_WON'))::int AS closed_won_count,
+        (COUNT(*) FILTER (WHERE "status" = 'CLOSED_LOST'))::int AS closed_lost_count,
+        (COUNT(*) FILTER (WHERE "interested_plan" = 'STARTER'))::int AS starter_count,
+        (COUNT(*) FILTER (WHERE "interested_plan" = 'PROFESSIONAL'))::int AS professional_count,
+        (COUNT(*) FILTER (WHERE "interested_plan" = 'ENTERPRISE'))::int AS enterprise_count,
+        (COUNT(*) FILTER (WHERE "created_at" >= NOW() - INTERVAL '7 days'))::int AS recent_count,
+        (COUNT(*) FILTER (WHERE "source" = 'form'))::int AS form_count,
+        (COUNT(*) FILTER (WHERE "source" = 'manual'))::int AS manual_count
+      FROM "leads";
+    `;
 
-    return {
+    const row = rows[0];
+    const total = row ? toNumber(row.total) : 0;
+    const closedWon = row ? toNumber(row.closed_won_count) : 0;
+
+    const summary: LeadSummary = {
       total,
-      new: statusCounts["new"] ?? 0,
-      contacted: statusCounts["contacted"] ?? 0,
-      qualified: statusCounts["qualified"] ?? 0,
+      new: row ? toNumber(row.new_count) : 0,
+      contacted: row ? toNumber(row.contacted_count) : 0,
+      qualified: row ? toNumber(row.qualified_count) : 0,
       closed_won: closedWon,
-      closed_lost: statusCounts["closed_lost"] ?? 0,
+      closed_lost: row ? toNumber(row.closed_lost_count) : 0,
       byPlan: {
-        starter: planCounts["starter"] ?? 0,
-        professional: planCounts["professional"] ?? 0,
-        enterprise: planCounts["enterprise"] ?? 0,
+        starter: row ? toNumber(row.starter_count) : 0,
+        professional: row ? toNumber(row.professional_count) : 0,
+        enterprise: row ? toNumber(row.enterprise_count) : 0,
       },
-      recentCount,
-      formCount,
-      manualCount,
+      recentCount: row ? toNumber(row.recent_count) : 0,
+      formCount: row ? toNumber(row.form_count) : 0,
+      manualCount: row ? toNumber(row.manual_count) : 0,
       conversionRate: total > 0 ? Math.round((closedWon / total) * 100) : 0,
     };
+
+    await cacheService
+      .setJson(SUMMARY_CACHE_KEY, summary, SUMMARY_CACHE_TTL_SECONDS)
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error("Failed to cache summary:", message);
+      });
+
+    return summary;
   }
 }
 

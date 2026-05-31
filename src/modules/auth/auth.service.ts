@@ -1,12 +1,38 @@
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
+import jwt, { type SignOptions } from 'jsonwebtoken';
+import { createHash, randomBytes } from 'crypto';
 import { prisma } from '../../db/prisma';
 import { env } from '../../config/env';
-import type { LoginInput, CreateAdminInput } from './auth.schema';
+import { enqueueEmailJob } from '../email/email.queue';
+import type {
+  ChangePasswordInput,
+  CreateAdminInput,
+  LoginInput,
+  PasswordResetConfirmInput,
+  PasswordResetRequestInput,
+} from './auth.schema';
+
+function signAdminToken(admin: { id: string; email: string; tokenVersion: number }): string {
+  return jwt.sign(
+    { id: admin.id, email: admin.email, tokenVersion: admin.tokenVersion },
+    env.JWT_SECRET,
+    { expiresIn: env.JWT_EXPIRES_IN as SignOptions['expiresIn'] },
+  );
+}
+
+function hashResetToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function buildResetUrl(token: string): string {
+  const url = new URL('/reset-password', env.ADMIN_APP_URL);
+  url.searchParams.set('token', token);
+  return url.toString();
+}
 
 export class AuthService {
   async login(data: LoginInput) {
-    const admin = await (prisma as any).adminUser.findUnique({
+    const admin = await prisma.adminUser.findUnique({
       where: { email: data.email },
     });
 
@@ -15,34 +41,118 @@ export class AuthService {
     const valid = await bcrypt.compare(data.password, admin.passwordHash);
     if (!valid) throw new Error('Invalid credentials');
 
-    await (prisma as any).adminUser.update({
+    const updated = await prisma.adminUser.update({
       where: { id: admin.id },
-      data:  { lastLoginAt: new Date() },
+      data: { lastLoginAt: new Date() },
     });
 
-    // Cast expiresIn to any to satisfy strict jsonwebtoken overloads
-    const token = jwt.sign(
-      { id: admin.id, email: admin.email },
-      env.JWT_SECRET,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      { expiresIn: env.JWT_EXPIRES_IN as any }
-    );
+    const token = signAdminToken(updated);
 
     return {
       token,
-      user: { id: admin.id, email: admin.email, name: admin.name },
+      user: { id: updated.id, email: updated.email, name: updated.name },
     };
   }
 
   async createAdmin(data: CreateAdminInput) {
-    const existing = await (prisma as any).adminUser.findUnique({ where: { email: data.email } });
+    const existing = await prisma.adminUser.findUnique({ where: { email: data.email } });
     if (existing) throw new Error('Admin with this email already exists');
 
     const passwordHash = await bcrypt.hash(data.password, 12);
 
-    return (prisma as any).adminUser.create({
-      data:   { email: data.email, passwordHash, name: data.name },
+    return prisma.adminUser.create({
+      data: { email: data.email, passwordHash, name: data.name },
       select: { id: true, email: true, name: true, createdAt: true },
+    });
+  }
+
+  async logoutAll(adminId: string): Promise<void> {
+    await prisma.adminUser.update({
+      where: { id: adminId },
+      data: { tokenVersion: { increment: 1 } },
+    });
+  }
+
+  async changePassword(adminId: string, data: ChangePasswordInput): Promise<void> {
+    const admin = await prisma.adminUser.findUnique({ where: { id: adminId } });
+    if (!admin) throw new Error('Admin not found');
+
+    const valid = await bcrypt.compare(data.currentPassword, admin.passwordHash);
+    if (!valid) throw new Error('Invalid current password');
+
+    const passwordHash = await bcrypt.hash(data.newPassword, 12);
+    await prisma.adminUser.update({
+      where: { id: adminId },
+      data: {
+        passwordHash,
+        tokenVersion: { increment: 1 },
+      },
+    });
+  }
+
+  async requestPasswordReset(data: PasswordResetRequestInput): Promise<void> {
+    const admin = await prisma.adminUser.findUnique({ where: { email: data.email } });
+    if (!admin) return;
+
+    const token = randomBytes(32).toString('hex');
+    const tokenHash = hashResetToken(token);
+    const expiresAt = new Date(Date.now() + env.PASSWORD_RESET_TOKEN_TTL_MINUTES * 60_000);
+
+    await prisma.passwordResetToken.deleteMany({
+      where: {
+        adminUserId: admin.id,
+        OR: [{ expiresAt: { lt: new Date() } }, { usedAt: { not: null } }],
+      },
+    });
+
+    await prisma.passwordResetToken.create({
+      data: {
+        adminUserId: admin.id,
+        tokenHash,
+        expiresAt,
+      },
+    });
+
+    await enqueueEmailJob({
+      type: 'password-reset',
+      recipient: admin.email,
+      adminName: admin.name,
+      resetUrl: buildResetUrl(token),
+    }).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('Failed to queue password reset email:', message);
+    });
+  }
+
+  async confirmPasswordReset(data: PasswordResetConfirmInput): Promise<void> {
+    const tokenHash = hashResetToken(data.token);
+    const resetToken = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { adminUser: true },
+    });
+
+    if (!resetToken || resetToken.usedAt || resetToken.expiresAt <= new Date()) {
+      throw new Error('Invalid or expired reset token');
+    }
+
+    const consumed = await prisma.passwordResetToken.updateMany({
+      where: {
+        id: resetToken.id,
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      data: { usedAt: new Date() },
+    });
+
+    if (consumed.count !== 1) throw new Error('Invalid or expired reset token');
+
+    const passwordHash = await bcrypt.hash(data.newPassword, 12);
+    await prisma.adminUser.update({
+      where: { id: resetToken.adminUserId },
+      data: {
+        passwordHash,
+        tokenVersion: { increment: 1 },
+      },
     });
   }
 }

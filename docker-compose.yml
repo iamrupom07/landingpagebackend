@@ -18,34 +18,88 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build:
+      context: .
+      target: builder
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://leadgen:leadgen_secret@db:5432/leadgen_db?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: redis://redis:6379
+    command: ["npx", "prisma", "migrate", "deploy"]
+    restart: "no"
+
   api:
     build: .
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "5000:5000"
     environment:
       NODE_ENV: production
       PORT: 5000
       DATABASE_URL: postgresql://leadgen:leadgen_secret@db:5432/leadgen_db?sslmode=disable
+      REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET}
-      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1h}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      ADMIN_APP_URL: ${ADMIN_APP_URL:-http://localhost:3000}
+      MAX_EXPORT_ROWS: ${MAX_EXPORT_ROWS:-50000}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
       NOTIFICATION_EMAIL: ${NOTIFICATION_EMAIL:-}
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@123456}
-      ADMIN_NAME: ${ADMIN_NAME:-Admin}
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/health/ready || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://leadgen:leadgen_secret@db:5432/leadgen_db?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      NOTIFICATION_EMAIL: ${NOTIFICATION_EMAIL:-}
+    command: ["node", "dist/workers/email.worker.js"]
 
 volumes:
   postgres_data:
