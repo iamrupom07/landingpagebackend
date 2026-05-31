@@ -1,0 +1,79 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Plan {
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  CLOSED_WON
+  CLOSED_LOST
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model Lead {
+  id              String     @id @default(uuid())
+  businessName    String     @map("business_name")
+  businessAddress String     @map("business_address")
+  contactName     String     @map("contact_name")
+  phone           String
+  email           String
+  currentProvider String     @map("current_provider")
+  interestedPlan  Plan?      @map("interested_plan")
+  employeeCount   Int?       @map("employee_count")
+  comments        String?
+  status          LeadStatus @default(NEW)
+  source          String     @default("form") @map("source") // "form" | "manual"
+  ipAddress       String?    @map("ip_address")
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  emailLogs EmailLog[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([interestedPlan])
+  @@index([source])
+  @@map("leads")
+}
+
+model AdminUser {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  name         String
+  createdAt    DateTime  @default(now()) @map("created_at")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  @@map("admin_users")
+}
+
+model EmailLog {
+  id           String   @id @default(uuid())
+  leadId       String   @map("lead_id")
+  type         String
+  subject      String?
+  recipient    String
+  status       String   @default("sent")
+  errorMessage String?  @map("error_message")
+  sentAt       DateTime @default(now()) @map("sent_at")
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId])
+  @@map("email_logs")
+}
