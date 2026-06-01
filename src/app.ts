@@ -37,6 +37,7 @@ const globalLimiter = createRateLimiter({
   name: "global",
   windowMs: 15 * 60 * 1000,
   max: 200,
+  failOpenOnStoreError: true,
   message: {
     success: false,
     message: "Too many requests, please try again later.",
@@ -51,7 +52,7 @@ const leadSubmitLimiter = createRateLimiter({
     success: false,
     message: "Too many submissions from this IP. Please try again later.",
   },
-  skip: (req) => req.method !== "POST",
+  failOpenOnStoreError: true,
 });
 
 app.use(globalLimiter);
@@ -103,7 +104,8 @@ app.get("/health/ready", async (_req, res) => {
 });
 
 app.use("/api/auth", authRouter);
-app.use("/api/leads", leadSubmitLimiter, leadsRouter);
+app.post("/api/leads", leadSubmitLimiter);
+app.use("/api/leads", leadsRouter);
 app.use("/api/analytics", analyticsRouter);
 
 app.use((_req, res) => {

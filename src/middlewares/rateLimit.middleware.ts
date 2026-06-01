@@ -4,6 +4,7 @@ import { getRedis } from "../config/redis";
 
 type LimiterOptions = Partial<Options> & {
   name: string;
+  failOpenOnStoreError?: boolean;
 };
 
 function redisStore(name: string): RedisStore | undefined {
@@ -22,12 +23,12 @@ function redisStore(name: string): RedisStore | undefined {
 }
 
 export function createRateLimiter(options: LimiterOptions) {
-  const { name, ...rest } = options;
+  const { name, failOpenOnStoreError = false, ...rest } = options;
 
   return rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
-    passOnStoreError: false,
+    passOnStoreError: failOpenOnStoreError,
     store: redisStore(name),
     ...rest,
   });

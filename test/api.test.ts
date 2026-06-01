@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -35,6 +36,17 @@ const testState = vi.hoisted(() => {
   };
 
   const resetTokens = new Map<string, any>();
+  const redisStore = new Map<string, string>();
+  const redis = {
+    get: vi.fn(async (key: string) => redisStore.get(key) ?? null),
+    set: vi.fn(
+      async (key: string, value: string, _mode: string, _ttlSeconds: number) => {
+        redisStore.set(key, value);
+        return 'OK';
+      },
+    ),
+    del: vi.fn(async (key: string) => (redisStore.delete(key) ? 1 : 0)),
+  };
 
   const pick = (select: Record<string, boolean> | undefined) => {
     if (!select) return { ...admin };
@@ -100,6 +112,9 @@ const testState = vi.hoisted(() => {
     admin,
     prisma,
     resetTokens,
+    redis,
+    redisStore,
+    useRedis: false,
     enqueueEmailJob: vi.fn(async () => ({ queued: true })),
   };
 });
@@ -114,7 +129,14 @@ vi.mock('../src/modules/email/email.queue', () => ({
   closeEmailQueue: vi.fn(),
 }));
 
+vi.mock('../src/config/redis', () => ({
+  getRedis: () => (testState.useRedis ? testState.redis : null),
+  pingRedis: vi.fn(async () => testState.useRedis),
+  closeRedis: vi.fn(),
+}));
+
 import app from '../src/app';
+import { adminTokenVersionCacheKey } from '../src/modules/auth/auth.cache';
 import { cacheService } from '../src/services/cache.service';
 import { leadsService, type LeadSummary } from '../src/modules/leads/leads.service';
 
@@ -140,20 +162,28 @@ function leadRow(overrides: Record<string, unknown> = {}) {
 }
 
 async function loginToken(): Promise<string> {
-  const response = await request(app)
-    .post('/api/auth/login')
-    .send({ email: testState.admin.email, password: 'Secret123!' });
-  return response.body.data.token;
+  return jwt.sign(
+    {
+      id: testState.admin.id,
+      email: testState.admin.email,
+      tokenVersion: testState.admin.tokenVersion,
+    },
+    process.env.JWT_SECRET!,
+    { expiresIn: '1h' },
+  );
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  testState.useRedis = false;
+  testState.redisStore.clear();
   testState.admin.passwordHash = bcrypt.hashSync('Secret123!', 12);
   testState.admin.tokenVersion = 0;
   testState.admin.lastLoginAt = null;
   testState.resetTokens.clear();
   testState.prisma.lead.findMany.mockResolvedValue([leadRow()]);
   testState.prisma.lead.create.mockResolvedValue(leadRow());
+  testState.prisma.lead.findUnique.mockResolvedValue({ ...leadRow(), emailLogs: [] });
 });
 
 describe('auth production hardening', () => {
@@ -173,6 +203,78 @@ describe('auth production hardening', () => {
     await request(app)
       .get('/api/auth/me')
       .set('Authorization', `Bearer ${token}`)
+      .expect(401);
+  });
+
+  it('uses cached admin token versions and falls back to the DB on cache misses', async () => {
+    testState.useRedis = true;
+    const token = await loginToken();
+    const cacheKey = adminTokenVersionCacheKey(testState.admin.id);
+
+    testState.redisStore.clear();
+    testState.redis.set.mockClear();
+    testState.prisma.adminUser.findUnique.mockClear();
+
+    await request(app)
+      .get('/api/leads')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(testState.prisma.adminUser.findUnique).toHaveBeenCalledWith({
+      where: { id: testState.admin.id },
+      select: { id: true, email: true, tokenVersion: true },
+    });
+    expect(testState.redis.set).toHaveBeenCalledWith(cacheKey, '0', 'EX', 60);
+
+    testState.prisma.adminUser.findUnique.mockClear();
+    testState.redis.get.mockClear();
+
+    await request(app)
+      .get('/api/leads')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(testState.redis.get).toHaveBeenCalledWith(cacheKey);
+    expect(testState.prisma.adminUser.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('updates cached token versions after logout and password changes', async () => {
+    testState.useRedis = true;
+    const token = await loginToken();
+    const cacheKey = adminTokenVersionCacheKey(testState.admin.id);
+
+    await request(app)
+      .get('/api/leads')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(testState.redisStore.get(cacheKey)).toBe('0');
+
+    await request(app)
+      .post('/api/auth/logout-all')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(testState.redisStore.get(cacheKey)).toBe('1');
+
+    await request(app)
+      .get('/api/leads')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(401);
+
+    const freshToken = await loginToken();
+
+    await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${freshToken}`)
+      .send({ currentPassword: 'Secret123!', newPassword: 'NewSecret123!' })
+      .expect(200);
+
+    expect(testState.redisStore.get(cacheKey)).toBe('2');
+
+    await request(app)
+      .get('/api/leads')
+      .set('Authorization', `Bearer ${freshToken}`)
       .expect(401);
   });
 
@@ -197,9 +299,87 @@ describe('auth production hardening', () => {
     expect(testState.admin.tokenVersion).toBe(1);
     expect(testState.resetTokens.get(tokenHash).usedAt).toBeInstanceOf(Date);
   });
+
+  it('updates cached token versions after password reset confirmation', async () => {
+    testState.useRedis = true;
+    const token = await loginToken();
+    const cacheKey = adminTokenVersionCacheKey(testState.admin.id);
+
+    await request(app)
+      .post('/api/auth/password-reset/request')
+      .send({ email: testState.admin.email })
+      .expect(200);
+
+    const job = testState.enqueueEmailJob.mock.calls[0][0];
+    const resetToken = new URL(job.resetUrl).searchParams.get('token')!;
+
+    await request(app)
+      .post('/api/auth/password-reset/confirm')
+      .send({ token: resetToken, newPassword: 'NewSecret123!' })
+      .expect(200);
+
+    expect(testState.redisStore.get(cacheKey)).toBe('1');
+
+    await request(app)
+      .get('/api/leads')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(401);
+  });
 });
 
 describe('lead performance safeguards', () => {
+  it('does not apply the public lead-submit limiter to admin POST routes', async () => {
+    const token = await loginToken();
+    const leadPayload = {
+      businessName: 'Acme Co',
+      businessAddress: '123 Main St',
+      contactName: 'Ada Lovelace',
+      phone: '5551234567',
+      email: 'ada@example.com',
+      currentProvider: 'Fiber Co',
+    };
+
+    for (let i = 0; i < 10; i += 1) {
+      await request(app).post('/api/leads').send(leadPayload).expect(201);
+    }
+
+    await request(app)
+      .post('/api/leads/manual')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ ...leadPayload, status: 'new' })
+      .expect(201);
+
+    await request(app)
+      .post('/api/leads/lead-1/email')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ subject: 'Hello', body: 'Following up.' })
+      .expect(200);
+  });
+
+  it('lists leads with stable ordering and the existing pagination response shape', async () => {
+    const token = await loginToken();
+
+    const response = await request(app)
+      .get('/api/leads?page=2&pageSize=5')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      success: true,
+      page: 2,
+      pageSize: 5,
+      total: 2,
+      totalPages: 1,
+    });
+    expect(testState.prisma.lead.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: 5,
+        take: 5,
+      }),
+    );
+  });
+
   it('streams CSV exports with a truncation header when more rows exist than the cap', async () => {
     const token = await loginToken();
 
@@ -255,6 +435,47 @@ describe('lead performance safeguards', () => {
 
     await expect(leadsService.getSummary()).resolves.toMatchObject({ total: 2, contacted: 1 });
     expect(setSpy).toHaveBeenCalledWith('analytics:summary', expect.objectContaining({ total: 2 }), 60);
+  });
+
+  it('shares one analytics aggregate query across concurrent cache misses', async () => {
+    const getSpy = vi.spyOn(cacheService, 'getJson').mockResolvedValue(null);
+    const setSpy = vi.spyOn(cacheService, 'setJson').mockResolvedValue();
+    testState.prisma.$queryRaw.mockResolvedValue([
+      {
+        total: 2,
+        new_count: 1,
+        contacted_count: 1,
+        qualified_count: 0,
+        closed_won_count: 0,
+        closed_lost_count: 0,
+        starter_count: 1,
+        professional_count: 1,
+        enterprise_count: 0,
+        recent_count: 2,
+        form_count: 2,
+        manual_count: 0,
+      },
+    ]);
+
+    await expect(Promise.all([leadsService.getSummary(), leadsService.getSummary()])).resolves.toEqual([
+      expect.objectContaining({ total: 2 }),
+      expect.objectContaining({ total: 2 }),
+    ]);
+
+    expect(testState.prisma.$queryRaw).toHaveBeenCalledOnce();
+    getSpy.mockRestore();
+    setSpy.mockRestore();
+  });
+
+  it('ignores and removes invalid JSON cache entries', async () => {
+    testState.useRedis = true;
+    testState.redisStore.set('broken-json', '{');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(cacheService.getJson('broken-json')).resolves.toBeNull();
+
+    expect(testState.redis.del).toHaveBeenCalledWith('broken-json');
+    errorSpy.mockRestore();
   });
 
   it('invalidates summary cache after lead creation', async () => {

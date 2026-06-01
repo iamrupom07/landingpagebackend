@@ -45,8 +45,12 @@ model Lead {
 
   @@index([status])
   @@index([createdAt])
+  @@index([createdAt(sort: Desc), id(sort: Desc)], map: "leads_created_at_id_idx")
   @@index([interestedPlan])
+  @@index([interestedPlan, createdAt(sort: Desc), id(sort: Desc)], map: "leads_interested_plan_created_at_id_idx")
   @@index([source])
+  @@index([source, createdAt(sort: Desc), id(sort: Desc)], map: "leads_source_created_at_id_idx")
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)], map: "leads_status_created_at_id_idx")
   @@map("leads")
 }
 

@@ -19,6 +19,7 @@ import {
 const SUMMARY_CACHE_KEY = "analytics:summary";
 const SUMMARY_CACHE_TTL_SECONDS = 60;
 const EXPORT_BATCH_SIZE = 500;
+let summaryLoadPromise: Promise<LeadSummary> | null = null;
 
 export interface LeadApiShape {
   id: string;
@@ -218,7 +219,7 @@ export class LeadsService {
     const [rows, total] = await Promise.all([
       prisma.lead.findMany({
         where,
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
         skip,
         take: pageSize,
       }),
@@ -306,6 +307,14 @@ export class LeadsService {
     const cached = await cacheService.getJson<LeadSummary>(SUMMARY_CACHE_KEY);
     if (cached) return cached;
 
+    summaryLoadPromise ??= this.loadSummary().finally(() => {
+      summaryLoadPromise = null;
+    });
+
+    return summaryLoadPromise;
+  }
+
+  private async loadSummary(): Promise<LeadSummary> {
     const rows = await prisma.$queryRaw<SummaryRow[]>`
       SELECT
         (COUNT(*))::int AS total,

@@ -12,11 +12,13 @@ const redisQueueState = vi.hoisted(() => {
     queueCtor: vi.fn(),
   };
 
-  state.queueCtor.mockImplementation((_name: string, options: unknown) => ({
+  state.queueCtor.mockImplementation(function (_name: string, options: unknown) {
+    return {
       add: state.add,
       close: state.close,
       options,
-    }));
+    };
+  });
 
   return state;
 });

@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'crypto';
 import { prisma } from '../../db/prisma';
 import { env } from '../../config/env';
 import { enqueueEmailJob } from '../email/email.queue';
+import { setCachedAdminTokenVersion } from './auth.cache';
 import type {
   ChangePasswordInput,
   CreateAdminInput,
@@ -47,6 +48,7 @@ export class AuthService {
     });
 
     const token = signAdminToken(updated);
+    await setCachedAdminTokenVersion(updated.id, updated.tokenVersion);
 
     return {
       token,
@@ -67,10 +69,11 @@ export class AuthService {
   }
 
   async logoutAll(adminId: string): Promise<void> {
-    await prisma.adminUser.update({
+    const updated = await prisma.adminUser.update({
       where: { id: adminId },
       data: { tokenVersion: { increment: 1 } },
     });
+    await setCachedAdminTokenVersion(updated.id, updated.tokenVersion);
   }
 
   async changePassword(adminId: string, data: ChangePasswordInput): Promise<void> {
@@ -81,13 +84,14 @@ export class AuthService {
     if (!valid) throw new Error('Invalid current password');
 
     const passwordHash = await bcrypt.hash(data.newPassword, 12);
-    await prisma.adminUser.update({
+    const updated = await prisma.adminUser.update({
       where: { id: adminId },
       data: {
         passwordHash,
         tokenVersion: { increment: 1 },
       },
     });
+    await setCachedAdminTokenVersion(updated.id, updated.tokenVersion);
   }
 
   async requestPasswordReset(data: PasswordResetRequestInput): Promise<void> {
@@ -147,13 +151,14 @@ export class AuthService {
     if (consumed.count !== 1) throw new Error('Invalid or expired reset token');
 
     const passwordHash = await bcrypt.hash(data.newPassword, 12);
-    await prisma.adminUser.update({
+    const updated = await prisma.adminUser.update({
       where: { id: resetToken.adminUserId },
       data: {
         passwordHash,
         tokenVersion: { increment: 1 },
       },
     });
+    await setCachedAdminTokenVersion(updated.id, updated.tokenVersion);
   }
 }
 

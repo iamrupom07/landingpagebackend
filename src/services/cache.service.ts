@@ -5,8 +5,25 @@ export class CacheService {
     const redis = getRedis();
     if (!redis) return null;
 
-    const value = await redis.get(key);
-    return value ? (JSON.parse(value) as T) : null;
+    let value: string | null;
+    try {
+      value = await redis.get(key);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Failed to read cache key "${key}":`, message);
+      return null;
+    }
+
+    if (!value) return null;
+
+    try {
+      return JSON.parse(value) as T;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Failed to parse cache key "${key}":`, message);
+      await redis.del(key).catch(() => undefined);
+      return null;
+    }
   }
 
   async setJson(key: string, value: unknown, ttlSeconds: number): Promise<void> {
